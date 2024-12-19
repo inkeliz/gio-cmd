@@ -31,7 +31,7 @@ type buildInfo struct {
 	notaryAppleID  string
 	notaryPassword string
 	notaryTeamID   string
-	schemes 	   []string
+	schemes        []string
 }
 
 type Semver struct {
@@ -79,7 +79,7 @@ func newBuildInfo(pkgPath string) (*buildInfo, error) {
 		notaryAppleID:  *notaryID,
 		notaryPassword: *notaryPass,
 		notaryTeamID:   *notaryTeamID,
-		schemes: 		schemes,
+		schemes:        schemes,
 	}
 	return bi, nil
 }
@@ -92,6 +92,10 @@ func UppercaseName(name string) string {
 
 func (s Semver) String() string {
 	return fmt.Sprintf("%d.%d.%d.%d", s.Major, s.Minor, s.Patch, s.VersionCode)
+}
+
+func (s Semver) StringCompact() string {
+	return fmt.Sprintf("%d.%d.%d%d", s.Major, s.Minor, s.Patch, s.VersionCode)
 }
 
 func parseSemver(v string) (Semver, error) {
