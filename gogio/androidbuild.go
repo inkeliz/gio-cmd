@@ -40,15 +40,16 @@ type errWriter struct {
 var exeSuffix string
 
 type manifestData struct {
-	AppID       string
-	Version     Semver
-	MinSDK      int
-	TargetSDK   int
-	Permissions []string
-	Features    []string
-	IconSnip    string
-	AppName     string
-	Schemes     []string
+	AppID          string
+	Version        Semver
+	MinSDK         int
+	TargetSDK      int
+	Permissions    []string
+	Features       []string
+	IconSnip       string
+	AppName        string
+	Schemes        []string
+	QueriesSchemes []string
 }
 
 const (
@@ -484,15 +485,16 @@ func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, ex
 	permissions, features := getPermissions(perms)
 	appName := UppercaseName(bi.name)
 	manifestSrc := manifestData{
-		AppID:       bi.appID,
-		Version:     bi.version,
-		MinSDK:      minSDK,
-		TargetSDK:   targetSDK,
-		Permissions: permissions,
-		Features:    features,
-		IconSnip:    iconSnip,
-		AppName:     appName,
-		Schemes:     bi.schemes,
+		AppID:          bi.appID,
+		Version:        bi.version,
+		MinSDK:         minSDK,
+		TargetSDK:      targetSDK,
+		Permissions:    permissions,
+		Features:       features,
+		IconSnip:       iconSnip,
+		AppName:        appName,
+		Schemes:        bi.schemes,
+		QueriesSchemes: bi.queriesSchemes,
 	}
 	tmpl, err := template.New("test").Parse(
 		`<?xml version="1.0" encoding="utf-8"?>
@@ -500,6 +502,11 @@ func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, ex
 	package="{{.AppID}}"
 	android:versionCode="{{.Version.VersionCode}}"
 	android:versionName="{{.Version}}">
+ 	<queries>
+	    {{range .QueriesSchemes}}
+        <package android:name="{{.}}" />
+        {{end}}
+    </queries>
 	<uses-sdk android:minSdkVersion="{{.MinSDK}}" android:targetSdkVersion="{{.TargetSDK}}" />
 {{range .Permissions}}	<uses-permission android:name="{{.}}"/>
 {{end}}{{range .Features}}	<uses-feature android:{{.}} android:required="false"/>
