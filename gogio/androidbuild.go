@@ -5,6 +5,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -151,6 +152,19 @@ func buildAndroid(tmpDir string, bi *buildInfo) error {
 	}
 	if err := visitPkg(pkgs[0]); err != nil {
 		return err
+	}
+
+	// Deduplicate libraries (Jars and AARs)
+	allLibs := append(extraJars, extraAARs...)
+	uniqueLibs := deduplicateLibraries(allLibs)
+	extraJars = nil
+	extraAARs = nil
+	for _, lib := range uniqueLibs {
+		if filepath.Ext(lib) == ".jar" {
+			extraJars = append(extraJars, lib)
+		} else if filepath.Ext(lib) == ".aar" {
+			extraAARs = append(extraAARs, lib)
+		}
 	}
 
 	if err := compileAndroid(tmpDir, tools, bi); err != nil {
@@ -343,35 +357,6 @@ func archiveAndroid(tmpDir string, bi *buildInfo, perms []string) (err error) {
 func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, extraAARs, perms []string, isBundle bool) (err error) {
 	classes := filepath.Join(tmpDir, "classes")
 	var classFiles []string
-	err = filepath.Walk(classes, func(path string, f os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if filepath.Ext(path) == ".class" {
-			classFiles = append(classFiles, path)
-		}
-		return nil
-	})
-
-	// extract the jar files from the aars
-	aarOut := filepath.Join(tmpDir, "aars")
-	for _, aar := range extraAARs {
-		name := filepath.Base(aar)
-		name = strings.TrimSuffix(name, filepath.Ext(name))
-
-		if err := extractZip(filepath.Join(aarOut, name), aar); err != nil {
-			return err
-		}
-	}
-
-	// extract the jar files from the aars
-	jarsFromAAR, err := filepath.Glob(filepath.Join(aarOut, "*", "*.jar"))
-	if err != nil {
-		return err
-	}
-	extraJars = append(extraJars, jarsFromAAR...)
-	classFiles = append(classFiles, extraJars...)
-
 	dexDir := filepath.Join(tmpDir, "apk")
 	if err := os.MkdirAll(dexDir, 0o755); err != nil {
 		return err
@@ -385,21 +370,31 @@ func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, ex
 	if minSDK > targetSDK {
 		targetSDK = minSDK
 	}
-	if len(classFiles) > 0 {
-		d8 := exec.Command(
-			filepath.Join(tools.buildtools, "d8"),
-			"--lib", tools.androidjar,
-			"--output", dexDir,
-			"--min-api", strconv.Itoa(minSDK),
-		)
-		d8.Args = append(d8.Args, classFiles...)
-		if _, err := runCmd(d8); err != nil {
-			major, minor, ok := determineJDKVersion()
-			if ok && (major != 1 || minor != 8) {
-				return fmt.Errorf("unsupported JDK version %d.%d, expected 1.8\nd8 error: %v", major, minor, err)
-			}
+
+	// extract the jar files from the aars
+	aarOut := filepath.Join(tmpDir, "aars")
+	var manifestsFromAAR []string
+	var packagesFromAAR []string
+	for _, aar := range extraAARs {
+		name := filepath.Base(aar)
+		name = strings.TrimSuffix(name, filepath.Ext(name))
+		out := filepath.Join(aarOut, name)
+		if err := extractZip(out, aar); err != nil {
 			return err
 		}
+		manifest := filepath.Join(out, "AndroidManifest.xml")
+		if _, err := os.Stat(manifest); err == nil {
+			manifestsFromAAR = append(manifestsFromAAR, manifest)
+			if pkg, err := getPackageName(manifest); err == nil {
+				packagesFromAAR = append(packagesFromAAR, pkg)
+			}
+		}
+	}
+
+	// extract the jar files from the aars
+	jarsFromAAR, err := filepath.Glob(filepath.Join(aarOut, "*", "*.jar"))
+	if err != nil {
+		return err
 	}
 
 	// Compile resources.
@@ -538,11 +533,6 @@ func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, ex
 		return err
 	}
 
-	manifestsFromAAR, err := filepath.Glob(filepath.Join(aarOut, "*", "AndroidManifest.xml"))
-	if err != nil {
-		return err
-	}
-
 	// Merge manifests, if any.
 	if len(manifestsFromAAR) > 0 {
 		if _, err := os.Stat(filepath.Join(tools.buildtools, "manifest-merger.jar")); err != nil {
@@ -562,6 +552,10 @@ func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, ex
 	}
 
 	linkAPK := filepath.Join(tmpDir, "link.apk")
+	genDir := filepath.Join(tmpDir, "gen")
+	if err := os.MkdirAll(genDir, 0o755); err != nil {
+		return err
+	}
 
 	args := []string{
 		"link",
@@ -569,6 +563,10 @@ func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, ex
 		"-I", tools.androidjar,
 		"-o", linkAPK,
 		"--auto-add-overlay",
+		"--java", genDir,
+	}
+	if len(packagesFromAAR) > 0 {
+		args = append(args, "--extra-packages", strings.Join(packagesFromAAR, ":"))
 	}
 	if isBundle {
 		args = append(args, "--proto-format")
@@ -585,6 +583,71 @@ func exeAndroid(tmpDir string, tools *androidTools, bi *buildInfo, extraJars, ex
 
 	if _, err := runCmd(exec.Command(aapt2, args...)); err != nil {
 		return err
+	}
+
+	// Compile R.java files.
+	var rJavaFiles []string
+	err = filepath.Walk(genDir, func(path string, f os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if filepath.Ext(path) == ".java" {
+			rJavaFiles = append(rJavaFiles, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(rJavaFiles) > 0 {
+		javac, err := findJavaC()
+		if err != nil {
+			return err
+		}
+		javacCmd := exec.Command(
+			javac,
+			"-target", "1.8",
+			"-source", "1.8",
+			"-bootclasspath", tools.androidjar,
+			"-d", classes,
+		)
+		javacCmd.Args = append(javacCmd.Args, rJavaFiles...)
+		if _, err := runCmd(javacCmd); err != nil {
+			return err
+		}
+	}
+
+	err = filepath.Walk(classes, func(path string, f os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if filepath.Ext(path) == ".class" {
+			classFiles = append(classFiles, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	extraJars = deduplicateLibraries(append(extraJars, jarsFromAAR...))
+	classFiles = append(classFiles, extraJars...)
+
+	if len(classFiles) > 0 {
+		d8 := exec.Command(
+			filepath.Join(tools.buildtools, "d8"),
+			"--lib", tools.androidjar,
+			"--output", dexDir,
+			"--min-api", strconv.Itoa(minSDK),
+		)
+		d8.Args = append(d8.Args, classFiles...)
+		if _, err := runCmd(d8); err != nil {
+			major, minor, ok := determineJDKVersion()
+			if ok && (major != 1 || minor != 8) {
+				return fmt.Errorf("unsupported JDK version %d.%d, expected 1.8\nd8 error: %v", major, minor, err)
+			}
+			return err
+		}
 	}
 
 	// The Go standard library archive/zip doesn't support appending to zip
@@ -785,6 +848,22 @@ func signAAB(tmpDir string, aabFile string, tools *androidTools, bi *buildInfo) 
 	))
 
 	return err
+}
+
+func getPackageName(manifestPath string) (string, error) {
+	f, err := os.Open(manifestPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	var manifest struct {
+		Package string `xml:"package,attr"`
+	}
+	if err := xml.NewDecoder(f).Decode(&manifest); err != nil {
+		return "", err
+	}
+	return manifest.Package, nil
 }
 
 func zipalign(tools *androidTools, input, output string) error {
