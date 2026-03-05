@@ -94,39 +94,62 @@ func buildJS(bi *buildInfo) error {
 	if err != nil {
 		return err
 	}
-	extraJS, err := findPackagesJS(pkgs[0], make(map[string]bool))
+	extraJS, extraServiceWorkers, err := findPackagesJS(pkgs[0], make(map[string]bool))
 	if err != nil {
 		return err
 	}
 
-	return mergeJSFiles(filepath.Join(out, "wasm.js"), append([]string{wasmJS}, extraJS...)...)
+	loadSW := "\n"
+	if len(extraServiceWorkers) > 0 {
+		loadSW += jsStartServiceWorker
+	}
+
+	if err := mergeJSFiles(filepath.Join(out, "wasm.js"), jsSetGo+loadSW, jsStartGo, append([]string{wasmJS}, extraJS...)...); err != nil {
+		return err
+	}
+
+	if err := mergeJSFiles(filepath.Join(out, "sw.js"), "", "", extraServiceWorkers...); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func findPackagesJS(p *packages.Package, visited map[string]bool) (extraJS []string, err error) {
+func findPackagesJS(p *packages.Package, visited map[string]bool) (extraJS []string, extraServiceWorkers []string, err error) {
 	if len(p.GoFiles) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
+
 	js, err := filepath.Glob(filepath.Join(filepath.Dir(p.GoFiles[0]), "*_js.js"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	extraJS = append(extraJS, js...)
+
+	sw, err := filepath.Glob(filepath.Join(filepath.Dir(p.GoFiles[0]), "*_js.sw"))
+	if err != nil {
+		return nil, nil, err
+	}
+	extraServiceWorkers = append(extraServiceWorkers, sw...)
+
 	for _, imp := range p.Imports {
 		if !visited[imp.ID] {
-			extra, err := findPackagesJS(imp, visited)
+			newExtra, newExtraSW, err := findPackagesJS(imp, visited)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			extraJS = append(extraJS, extra...)
+			extraJS = append(extraJS, newExtra...)
+			extraServiceWorkers = append(extraServiceWorkers, newExtraSW...)
 			visited[imp.ID] = true
 		}
 	}
-	return extraJS, nil
+
+	return extraJS, extraServiceWorkers, nil
 }
 
 // mergeJSFiles will merge all files into a single `wasm.js`. It will prepend the jsSetGo
 // and append the jsStartGo.
-func mergeJSFiles(dst string, files ...string) (err error) {
+func mergeJSFiles(dst string, start, end string, files ...string) (err error) {
 	w, err := os.Create(dst)
 	if err != nil {
 		return err
@@ -136,7 +159,7 @@ func mergeJSFiles(dst string, files ...string) (err error) {
 			err = cerr
 		}
 	}()
-	_, err = io.Copy(w, strings.NewReader(jsSetGo))
+	_, err = io.Copy(w, strings.NewReader(start))
 	if err != nil {
 		return err
 	}
@@ -151,7 +174,7 @@ func mergeJSFiles(dst string, files ...string) (err error) {
 			return err
 		}
 	}
-	_, err = io.Copy(w, strings.NewReader(jsStartGo))
+	_, err = io.Copy(w, strings.NewReader(end))
 	return err
 }
 
@@ -201,5 +224,11 @@ const (
     WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then((result) => {
         go.run(result.instance);
     });
+})();`
+
+	jsStartServiceWorker = `(() => {
+	if ("serviceWorker" in navigator) {
+		navigator.serviceWorker.register("sw.js");
+	}
 })();`
 )
